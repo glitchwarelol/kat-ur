@@ -1,0 +1,141 @@
+name: Poll R2 Queue and Build UR Packages
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS CLI for R2
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws configure set region auto
+
+      - name: Check R2 queue for new packages
+        id: check
+        run: |
+          QUEUED=$(aws s3 ls s3://${{ secrets.R2_BUCKET }}/queue/ \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }} 2>/dev/null | grep '\.recipe' | awk '{print $4}')
+
+          if [ -z "$QUEUED" ]; then
+            echo "No packages in queue"
+            echo "has_packages=false" >> $GITHUB_OUTPUT
+          else
+            echo "Found packages in queue:"
+            echo "$QUEUED"
+            echo "has_packages=true" >> $GITHUB_OUTPUT
+            echo "packages<<EOF" >> $GITHUB_OUTPUT
+            echo "$QUEUED" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and publish queued packages
+        if: steps.check.outputs.has_packages == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          aws s3 cp s3://${{ secrets.R2_BUCKET }}/index-ur.json index-ur.json \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }} || echo '[]' > index-ur.json
+
+          echo "${{ steps.check.outputs.packages }}" | while read -r recipe_file; do
+            if [ -z "$recipe_file" ]; then continue; fi
+
+            echo "=== Processing: $recipe_file ==="
+
+            aws s3 cp "s3://${{ secrets.R2_BUCKET }}/queue/$recipe_file" "/tmp/$recipe_file" \
+              --endpoint-url ${{ secrets.R2_ENDPOINT }}
+
+            RECIPE="/tmp/$recipe_file"
+
+            PKG_NAME=$(grep '^name=' "$RECIPE" | cut -d'=' -f2)
+            PKG_VERSION=$(grep '^version=' "$RECIPE" | cut -d'=' -f2)
+            PKG_DESC=$(grep '^description=' "$RECIPE" | cut -d'=' -f2-)
+            PKG_ARCH=$(grep '^arch=' "$RECIPE" | cut -d'=' -f2)
+            PKG_DEPS=$(grep '^dependencies=' "$RECIPE" | cut -d'=' -f2-)
+            PKG_SOURCE=$(grep '^source=' "$RECIPE" | cut -d'=' -f2-)
+            BUILD_CMD=$(grep '^build_command=' "$RECIPE" | cut -d'=' -f2-)
+            BINARY_PATH=$(grep '^binary_path=' "$RECIPE" | cut -d'=' -f2-)
+
+            if [ -z "$PKG_ARCH" ]; then PKG_ARCH="x86_64"; fi
+            if [ -z "$PKG_DEPS" ]; then PKG_DEPS=""; fi
+            if [ -z "$BINARY_PATH" ]; then BINARY_PATH="$PKG_NAME"; fi
+
+            echo "Building $PKG_NAME v$PKG_VERSION"
+
+            BUILD_DIR="/tmp/kat-build-$$"
+            mkdir -p "$BUILD_DIR"
+            git clone "$PKG_SOURCE" "$BUILD_DIR"
+
+            cd "$BUILD_DIR"
+            eval "$BUILD_CMD"
+
+            if [ ! -f "$BUILD_DIR/$BINARY_PATH" ]; then
+              echo "ERROR: Binary not found at $BINARY_PATH"
+              find "$BUILD_DIR" -type f -executable | head -20
+              aws s3 rm "s3://${{ secrets.R2_BUCKET }}/queue/$recipe_file" \
+                --endpoint-url ${{ secrets.R2_ENDPOINT }}
+              continue
+            fi
+
+            mkdir -p "$BUILD_DIR/files/usr/bin"
+            cp "$BUILD_DIR/$BINARY_PATH" "$BUILD_DIR/files/usr/bin/$PKG_NAME"
+            chmod +x "$BUILD_DIR/files/usr/bin/$PKG_NAME"
+
+            if [ -n "$PKG_DEPS" ]; then
+              DEPS_JSON=$(echo "$PKG_DEPS" | tr ',' '\n' | jq -R . | jq -s .)
+            else
+              DEPS_JSON="[]"
+            fi
+
+            cat > "$BUILD_DIR/files/metadata.json" << EOF
+          { "name": "$PKG_NAME", "version": "$PKG_VERSION", "description": "$PKG_DESC", "dependencies": $DEPS_JSON, "arch": "$PKG_ARCH", "files": ["usr/bin/$PKG_NAME"], "install_script": false }
+          EOF
+
+            KAT_FILE="${PKG_NAME}-${PKG_VERSION}-${PKG_ARCH}.kat"
+            cd "$BUILD_DIR/files"
+            tar czf "/tmp/$KAT_FILE" .
+
+            SHA256=$(sha256sum "/tmp/$KAT_FILE" | cut -d' ' -f1)
+            SIZE=$(stat -c%s "/tmp/$KAT_FILE")
+            TAG="${PKG_NAME}-${PKG_VERSION}"
+
+            gh release create "$TAG" "/tmp/$KAT_FILE" --repo ${{ github.repository }} \
+              --title "$TAG" --notes "$PKG_NAME v$PKG_VERSION" \
+              || gh release upload "$TAG" "/tmp/$KAT_FILE" --repo ${{ github.repository }} --clobber
+
+            DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${KAT_FILE}"
+
+            NEW_ENTRY=$(jq -n \
+              --arg name "$PKG_NAME" \
+              --arg version "$PKG_VERSION" \
+              --arg description "$PKG_DESC" \
+              --argjson dependencies "$DEPS_JSON" \
+              --arg size "$SIZE" \
+              --arg download_url "$DOWNLOAD_URL" \
+              --arg sha256 "$SHA256" \
+              --arg arch "$PKG_ARCH" \
+              '{name:$name,version:$version,description:$description,dependencies:$dependencies,size:$size,download_url:$download_url,sha256:$sha256,arch:$arch,repo:"user"}')
+
+            jq --argjson new "$NEW_ENTRY" \
+              'map(select(.name != $new.name)) + [$new]' index-ur.json > tmp.json && mv tmp.json index-ur.json
+
+            echo "Published $PKG_NAME v$PKG_VERSION"
+
+            aws s3 rm "s3://${{ secrets.R2_BUCKET }}/queue/$recipe_file" \
+              --endpoint-url ${{ secrets.R2_ENDPOINT }}
+
+            rm -rf "$BUILD_DIR" "/tmp/$KAT_FILE"
+          done
+
+      - name: Upload updated index to R2
+        if: steps.check.outputs.has_packages == 'true'
+        run: |
+          aws s3 cp index-ur.json s3://${{ secrets.R2_BUCKET }}/index-ur.json \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }}
+          echo "Index updated on R2"
