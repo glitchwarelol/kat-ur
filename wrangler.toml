@@ -1,7 +1,0 @@
-name = "kat-ur-submit"
-main = "src/index.js"
-compatibility_date = "2026-10-31"
-
-[[r2_buckets]]
-binding = "KATPKGS"
-bucket_name = "katpkgs-storage"
